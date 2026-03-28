@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify, send_from_directory
-from flask_cors import CORS
-import os, time, hashlib, secrets
+import os, time, hashlib, secrets, base64
 import psycopg2, psycopg2.extras
+from flask_cors import CORS
 
 app = Flask(__name__, static_folder='static')
 CORS(app)
@@ -18,6 +18,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY, username TEXT UNIQUE NOT NULL,
         password_hash TEXT NOT NULL, avatar_color TEXT NOT NULL,
+        avatar_img TEXT DEFAULT NULL,
         created_at BIGINT NOT NULL, last_seen BIGINT NOT NULL)''')
     c.execute('''CREATE TABLE IF NOT EXISTS conversations (
         id SERIAL PRIMARY KEY, name TEXT, is_group BOOLEAN DEFAULT FALSE,
@@ -35,6 +36,11 @@ def init_db():
         token TEXT PRIMARY KEY,
         user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         created_at BIGINT NOT NULL)''')
+    # Add avatar_img column if it doesn't exist (for existing DBs)
+    try:
+        c.execute('ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_img TEXT DEFAULT NULL')
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
@@ -49,12 +55,25 @@ def get_user_from_token(token):
 def tok():
     return request.headers.get('Authorization', '').replace('Bearer ', '')
 
+def user_is_online(last_seen):
+    return (int(time.time()) - last_seen) < 120  # online if active in last 2 min
+
 @app.route('/')
 def index():
     return send_from_directory('static', 'index.html')
 
 @app.route('/api/ping')
 def ping():
+    # Update last_seen if authenticated
+    token = tok()
+    if token:
+        try:
+            conn = get_db()
+            c = conn.cursor()
+            c.execute('UPDATE users SET last_seen=%s WHERE id=(SELECT user_id FROM sessions WHERE token=%s)',
+                      (int(time.time()), token))
+            conn.commit(); conn.close()
+        except: pass
     return jsonify({'ok': True})
 
 @app.route('/api/register', methods=['POST'])
@@ -82,7 +101,7 @@ def register():
     token = secrets.token_hex(32)
     c.execute('INSERT INTO sessions (token,user_id,created_at) VALUES (%s,%s,%s)', (token, user_id, now))
     conn.commit(); conn.close()
-    return jsonify({'token': token, 'user': {'id': user_id, 'username': username, 'avatar_color': color}})
+    return jsonify({'token': token, 'user': {'id': user_id, 'username': username, 'avatar_color': color, 'avatar_img': None}})
 
 @app.route('/api/login', methods=['POST'])
 def login():
@@ -101,14 +120,46 @@ def login():
     c.execute('INSERT INTO sessions (token,user_id,created_at) VALUES (%s,%s,%s)', (token, user['id'], now))
     c.execute('UPDATE users SET last_seen=%s WHERE id=%s', (now, user['id']))
     conn.commit(); conn.close()
-    return jsonify({'token': token, 'user': {'id': user['id'], 'username': user['username'], 'avatar_color': user['avatar_color']}})
+    return jsonify({'token': token, 'user': {
+        'id': user['id'], 'username': user['username'],
+        'avatar_color': user['avatar_color'], 'avatar_img': user['avatar_img']
+    }})
+
+@app.route('/api/me/avatar', methods=['POST'])
+def upload_avatar():
+    user = get_user_from_token(tok())
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
+    data = request.json
+    img_data = data.get('image', '')  # base64 data URL
+    if not img_data:
+        return jsonify({'error': 'No image'}), 400
+    # Limit to ~1MB
+    if len(img_data) > 1_400_000:
+        return jsonify({'error': 'Image too large (max ~1MB)'}), 400
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('UPDATE users SET avatar_img=%s WHERE id=%s', (img_data, user['id']))
+    conn.commit(); conn.close()
+    return jsonify({'ok': True, 'avatar_img': img_data})
+
+@app.route('/api/me/avatar', methods=['DELETE'])
+def delete_avatar():
+    user = get_user_from_token(tok())
+    if not user: return jsonify({'error': 'Unauthorized'}), 401
+    conn = get_db()
+    c = conn.cursor()
+    c.execute('UPDATE users SET avatar_img=NULL WHERE id=%s', (user['id'],))
+    conn.commit(); conn.close()
+    return jsonify({'ok': True})
 
 @app.route('/api/conversations', methods=['GET'])
 def get_conversations():
     user = get_user_from_token(tok())
     if not user: return jsonify({'error': 'Unauthorized'}), 401
+    # Update last_seen
     conn = get_db()
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    c.execute('UPDATE users SET last_seen=%s WHERE id=%s', (int(time.time()), user['id']))
     c.execute('''
         SELECT c.id, c.name, c.is_group, c.created_at,
                (SELECT content FROM messages WHERE conversation_id=c.id ORDER BY sent_at DESC LIMIT 1) as last_message,
@@ -121,19 +172,25 @@ def get_conversations():
     for row in c.fetchall():
         row = dict(row)
         c2 = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        c2.execute('''SELECT u.id,u.username,u.avatar_color FROM users u
+        c2.execute('''SELECT u.id,u.username,u.avatar_color,u.avatar_img,u.last_seen FROM users u
             JOIN conversation_members cm ON u.id=cm.user_id WHERE cm.conversation_id=%s''', (row['id'],))
         members = [dict(m) for m in c2.fetchall()]
-        row['members'] = members
+        # strip avatar_img from members list to keep payload small (only need for DM header)
+        row['members'] = [{k:v for k,v in m.items() if k != 'avatar_img'} for m in members]
         if not row['is_group']:
             other = next((m for m in members if m['id'] != user['id']), None)
             if other:
                 row['display_name'] = other['username']
                 row['avatar_color'] = other['avatar_color']
+                row['avatar_img'] = other['avatar_img']
+                row['other_last_seen'] = other['last_seen']
+                row['other_online'] = user_is_online(other['last_seen'])
         else:
             row['display_name'] = row['name']
+            row['avatar_img'] = None
+            row['other_online'] = any(user_is_online(m['last_seen']) and m['id'] != user['id'] for m in members)
         convos.append(row)
-    conn.close()
+    conn.commit(); conn.close()
     return jsonify(convos)
 
 @app.route('/api/conversations', methods=['POST'])
@@ -191,7 +248,7 @@ def get_messages(convo_id):
     c.execute('SELECT 1 FROM conversation_members WHERE conversation_id=%s AND user_id=%s', (convo_id, user['id']))
     if not c.fetchone():
         conn.close(); return jsonify({'error': 'Forbidden'}), 403
-    c.execute('''SELECT m.*,u.username,u.avatar_color FROM messages m
+    c.execute('''SELECT m.*,u.username,u.avatar_color,u.avatar_img FROM messages m
         JOIN users u ON m.sender_id=u.id WHERE m.conversation_id=%s ORDER BY m.sent_at ASC''', (convo_id,))
     messages = [dict(r) for r in c.fetchall()]
     conn.close()
@@ -209,11 +266,12 @@ def send_message(convo_id):
     if not c.fetchone():
         conn.close(); return jsonify({'error': 'Forbidden'}), 403
     now = int(time.time())
+    c.execute('UPDATE users SET last_seen=%s WHERE id=%s', (now, user['id']))
     c.execute('INSERT INTO messages (conversation_id,sender_id,content,sent_at) VALUES (%s,%s,%s,%s) RETURNING id',
               (convo_id, user['id'], content, now))
     msg_id = c.fetchone()['id']
     conn.commit()
-    c.execute('SELECT m.*,u.username,u.avatar_color FROM messages m JOIN users u ON m.sender_id=u.id WHERE m.id=%s', (msg_id,))
+    c.execute('SELECT m.*,u.username,u.avatar_color,u.avatar_img FROM messages m JOIN users u ON m.sender_id=u.id WHERE m.id=%s', (msg_id,))
     msg = dict(c.fetchone())
     conn.close()
     return jsonify(msg)
@@ -226,9 +284,11 @@ def search_users():
     if not q: return jsonify([])
     conn = get_db()
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute('SELECT id,username,avatar_color FROM users WHERE username ILIKE %s AND id!=%s LIMIT 10',
+    c.execute('SELECT id,username,avatar_color,avatar_img,last_seen FROM users WHERE username ILIKE %s AND id!=%s LIMIT 10',
               (f'%{q}%', user['id']))
     users = [dict(r) for r in c.fetchall()]
+    for u in users:
+        u['online'] = user_is_online(u['last_seen'])
     conn.close()
     return jsonify(users)
 
@@ -236,14 +296,21 @@ def search_users():
 def poll_messages(convo_id):
     user = get_user_from_token(tok())
     if not user: return jsonify({'error': 'Unauthorized'}), 401
+    # Update last_seen on poll
     after = int(request.args.get('after', 0))
     conn = get_db()
     c = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    c.execute('''SELECT m.*,u.username,u.avatar_color FROM messages m JOIN users u ON m.sender_id=u.id
+    c.execute('UPDATE users SET last_seen=%s WHERE id=%s', (int(time.time()), user['id']))
+    c.execute('''SELECT m.*,u.username,u.avatar_color,u.avatar_img FROM messages m JOIN users u ON m.sender_id=u.id
         WHERE m.conversation_id=%s AND m.sent_at>%s ORDER BY m.sent_at ASC''', (convo_id, after))
     messages = [dict(r) for r in c.fetchall()]
-    conn.close()
-    return jsonify(messages)
+    # Also return online status of other members
+    c.execute('''SELECT u.id,u.username,u.last_seen FROM users u
+        JOIN conversation_members cm ON u.id=cm.user_id
+        WHERE cm.conversation_id=%s AND u.id!=%s''', (convo_id, user['id']))
+    members = [{'id':r['id'],'username':r['username'],'online':user_is_online(r['last_seen'])} for r in c.fetchall()]
+    conn.commit(); conn.close()
+    return jsonify({'messages': messages, 'members': members})
 
 init_db()
 
